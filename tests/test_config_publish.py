@@ -47,6 +47,30 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     Settings.from_env()
 
+    def test_preserves_virtualenv_python_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_python = root / "base-python"
+            base_python.write_bytes(b"")
+            venv_python = root / "venv-python"
+            venv_python.symlink_to(base_python)
+            with mock.patch.dict(
+                os.environ,
+                {"TA_GRADER_PYTHON": str(venv_python)},
+                clear=True,
+            ):
+                settings = Settings.from_env()
+
+            self.assertEqual(settings.grader_python, venv_python.absolute())
+            self.assertTrue(settings.grader_python.is_symlink())
+
+    def test_rejects_relative_grader_python_path(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"TA_GRADER_PYTHON": "python3"}, clear=True
+        ):
+            with self.assertRaisesRegex(ConfigError, "absolute path"):
+                Settings.from_env()
+
     def test_rejects_sqlite_on_shared_mount(self) -> None:
         with mock.patch.dict(
             os.environ,

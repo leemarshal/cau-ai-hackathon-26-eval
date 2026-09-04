@@ -23,6 +23,21 @@ def _path(name: str, default: str) -> Path:
     return Path(raw).expanduser().resolve(strict=False)
 
 
+def _executable_path(name: str, default: str) -> Path:
+    """Return an absolute executable path without dereferencing venv symlinks."""
+
+    raw = os.environ.get(name, default).strip()
+    if not raw:
+        raise ConfigError(f"{name} must not be empty")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ConfigError(f"{name} must be an absolute path")
+    # Resolving /opt/venv/bin/python3 to its base interpreter bypasses the
+    # venv's pyvenv.cfg and site-packages.  absolute() normalizes the path
+    # while deliberately preserving the executable symlink.
+    return path.absolute()
+
+
 def _integer(name: str, default: int, *, minimum: int = 0) -> int:
     raw = os.environ.get(name, str(default)).strip()
     try:
@@ -137,7 +152,7 @@ class Settings:
         grade_script = _path(
             "TA_GRADE_SCRIPT", str(project_root / "ops/grade-finalist.py")
         )
-        grader_python = _path("TA_GRADER_PYTHON", sys.executable)
+        grader_python = _executable_path("TA_GRADER_PYTHON", sys.executable)
         min_bytes = _integer("TA_MIN_CHECKPOINT_BYTES", 300_000_000, minimum=1)
         max_bytes = _integer(
             "TA_MAX_CHECKPOINT_BYTES", 512 * 1024 * 1024, minimum=1
