@@ -126,7 +126,7 @@ class Settings:
     recursive_scan: bool
     worker_poll_seconds: float
     gpu_ids: tuple[int, ...]
-    max_submissions_per_team: int = 10
+    max_submissions_per_team: int = 30
     max_pending_captures: int = 6
     score_post_url: str = "https://api.minds.ai.kr/submit"
     score_post_timeout_seconds: float = 10.0
@@ -226,7 +226,7 @@ class Settings:
             ),
             gpu_ids=_gpus(),
             max_submissions_per_team=_integer(
-                "TA_MAX_SUBMISSIONS_PER_TEAM", 10, minimum=1
+                "TA_MAX_SUBMISSIONS_PER_TEAM", 30, minimum=1
             ),
             max_pending_captures=_integer(
                 "TA_MAX_PENDING_CAPTURES", 6, minimum=1

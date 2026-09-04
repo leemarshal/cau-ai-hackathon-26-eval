@@ -221,6 +221,7 @@ def check_environment(settings: Settings) -> dict:
         "grading_root": str(settings.grading_root),
         "grader_python": str(settings.grader_python),
         "grader_runtime": grader_runtime,
+        "max_submissions_per_team": settings.max_submissions_per_team,
         "score_post_url": settings.score_post_url,
         "teams": list(teams),
         "automatic_gpus": list(settings.gpu_ids),

@@ -32,7 +32,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.stable_confirmations, 3)
         self.assertEqual(settings.post_copy_seconds, 20.0)
         self.assertEqual(settings.min_checkpoint_bytes, 300_000_000)
-        self.assertEqual(settings.max_submissions_per_team, 10)
+        self.assertEqual(settings.max_submissions_per_team, 30)
         self.assertEqual(settings.max_pending_captures, 6)
         self.assertEqual(settings.gpu_ids, (1, 2, 3))
         self.assertEqual(
@@ -46,6 +46,13 @@ class ConfigTests(unittest.TestCase):
             ):
                 with self.assertRaises(ConfigError):
                     Settings.from_env()
+
+    def test_submission_limit_environment_overrides_default(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"TA_MAX_SUBMISSIONS_PER_TEAM": "17"}, clear=True
+        ):
+            settings = Settings.from_env()
+        self.assertEqual(settings.max_submissions_per_team, 17)
 
     def test_preserves_virtualenv_python_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
