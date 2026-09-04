@@ -85,6 +85,44 @@ class DatabaseTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _create_score_post(
+        self, token: str, *, team_number: int = 1, deliver: bool = False
+    ) -> tuple[dict, dict | None]:
+        value = marker(
+            token,
+            team_name=f"Team{team_number}_{token}",
+            team_number=team_number,
+        )
+        self.assertTrue(self.database.ingest_marker(value))
+        grading_claim = self.database.claim_next(
+            1, f"grader-{token}", "2026-09-04T08:00:00+00:00"
+        )
+        self.assertIsNotNone(grading_claim)
+        assert grading_claim is not None
+        self.database.mark_done(
+            value["submission_id"],
+            grading_claim["claim_token"],
+            "2026-09-04T08:10:00+00:00",
+            metrics(),
+            f"results/{token}/score.json",
+            f"results/{token}/score.audit.json",
+        )
+        if not deliver:
+            return value, None
+        post_claim = self.database.claim_next_score_post(
+            f"poster-{token}", "2026-09-04T08:10:00+00:00"
+        )
+        self.assertIsNotNone(post_claim)
+        assert post_claim is not None
+        self.assertTrue(
+            self.database.mark_score_post_delivered(
+                value["submission_id"],
+                post_claim["claim_token"],
+                "2026-09-04T08:11:00+00:00",
+            )
+        )
+        return value, post_claim
+
     def test_initialize_migrates_legacy_claims_and_source_dispositions(self) -> None:
         legacy_path = Path(self.temporary.name) / "legacy.sqlite3"
         legacy_schema = (
@@ -569,6 +607,138 @@ class DatabaseTests(unittest.TestCase):
                     "2026-09-04T07:00:01+00:00",
                 )
             )
+
+    def test_delivered_score_post_can_be_requeued_for_repost(self) -> None:
+        value, delivered_claim = self._create_score_post(
+            "single-repost", team_number=8, deliver=True
+        )
+        self.assertIsNotNone(delivered_claim)
+        before = self.database.score_post_rows()[0]
+        self.assertEqual(before["status"], "delivered")
+        self.assertEqual(before["attempt_count"], 1)
+
+        # The transition clears every ownership/delivery/error field even if a
+        # legacy or manually recovered delivered row retained stale metadata.
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE score_posts SET worker_id = 'stale-poster', "
+                "claim_token = ?, claimed_at = ?, last_failed_at = ?, "
+                "last_error = 'stale error' WHERE submission_id = ?",
+                (
+                    "f" * 64,
+                    "2026-09-04T08:12:00+00:00",
+                    "2026-09-04T08:12:01+00:00",
+                    value["submission_id"],
+                ),
+            )
+
+        due_at = "2026-09-04T09:00:00+00:00"
+        self.assertTrue(
+            self.database.requeue_delivered_score_post(
+                value["submission_id"], due_at
+            )
+        )
+        requeued = self.database.score_post_rows()[0]
+        self.assertEqual(requeued["status"], "pending")
+        self.assertEqual(requeued["attempt_count"], before["attempt_count"])
+        self.assertEqual(requeued["next_attempt_at"], due_at)
+        for field in (
+            "worker_id",
+            "claim_token",
+            "claimed_at",
+            "delivered_at",
+            "last_failed_at",
+            "last_error",
+        ):
+            self.assertIsNone(requeued[field], field)
+        self.assertIsNone(
+            self.database.claim_next_score_post(
+                "early-poster", "2026-09-04T08:59:59+00:00"
+            )
+        )
+        repost_claim = self.database.claim_next_score_post(
+            "reposter", due_at
+        )
+        self.assertIsNotNone(repost_claim)
+        self.assertEqual(repost_claim["submission_id"], value["submission_id"])
+        self.assertEqual(repost_claim["attempt_count"], 2)
+
+    def test_repost_requeue_rejects_non_delivered_and_missing_ids(self) -> None:
+        pending, _ = self._create_score_post(
+            "pending-repost", team_number=2
+        )
+        original = self.database.score_post_rows()[0]
+        self.assertFalse(
+            self.database.requeue_delivered_score_post(
+                pending["submission_id"], "2026-09-04T09:00:00+00:00"
+            )
+        )
+        self.assertEqual(self.database.score_post_rows()[0], original)
+
+        posting = self.database.claim_next_score_post(
+            "active-poster", "2026-09-04T08:10:00+00:00"
+        )
+        self.assertIsNotNone(posting)
+        self.assertFalse(
+            self.database.requeue_delivered_score_post(
+                posting["submission_id"], "2026-09-04T09:00:00+00:00"
+            )
+        )
+        still_posting = self.database.score_post_rows()[0]
+        self.assertEqual(still_posting["status"], "posting")
+        self.assertEqual(still_posting["claim_token"], posting["claim_token"])
+
+        self.assertFalse(
+            self.database.requeue_delivered_score_post(
+                str(uuid.uuid4()), "2026-09-04T09:00:00+00:00"
+            )
+        )
+
+    def test_all_delivered_score_posts_are_atomically_requeued(self) -> None:
+        first, first_claim = self._create_score_post(
+            "all-repost-1", team_number=3, deliver=True
+        )
+        second, second_claim = self._create_score_post(
+            "all-repost-2", team_number=4, deliver=True
+        )
+        pending, _ = self._create_score_post(
+            "all-repost-pending", team_number=5
+        )
+        self.assertIsNotNone(first_claim)
+        self.assertIsNotNone(second_claim)
+        before = {
+            row["submission_id"]: row for row in self.database.score_post_rows()
+        }
+
+        due_at = "2026-09-04T10:00:00+00:00"
+        self.assertEqual(
+            self.database.requeue_all_delivered_score_posts(due_at), 2
+        )
+        self.assertEqual(
+            self.database.requeue_all_delivered_score_posts(due_at), 0
+        )
+        after = {
+            row["submission_id"]: row for row in self.database.score_post_rows()
+        }
+        for submission_id in (first["submission_id"], second["submission_id"]):
+            self.assertEqual(after[submission_id]["status"], "pending")
+            self.assertEqual(after[submission_id]["next_attempt_at"], due_at)
+            self.assertEqual(
+                after[submission_id]["attempt_count"],
+                before[submission_id]["attempt_count"],
+            )
+            for field in (
+                "worker_id",
+                "claim_token",
+                "claimed_at",
+                "delivered_at",
+                "last_failed_at",
+                "last_error",
+            ):
+                self.assertIsNone(after[submission_id][field], field)
+        self.assertEqual(
+            after[pending["submission_id"]], before[pending["submission_id"]]
+        )
 
     def test_error_can_be_retried_and_attempt_count_increments(self) -> None:
         value = marker("retry")

@@ -190,6 +190,18 @@ state에 기록합니다. 같은 채점 DB를 쓰는 동안 환경이나 scorer 
 python3 ops/ta-grader.py retry <submission-UUID>
 ```
 
+리더보드 DB를 초기화한 뒤 로컬에서 이미 `delivered`로 기록된 점수를 다시 보내려면,
+초기화가 끝난 것을 확인한 후 다음 명령을 사용합니다. 채점 결과나 submission 상태는
+바꾸지 않고 POST outbox만 `pending`으로 되돌립니다.
+
+```bash
+# 특정 제출 하나
+python3 ops/ta-grader.py repost <submission-UUID>
+
+# 리더보드 전체 초기화 후 기존 delivered 점수 전부
+python3 ops/ta-grader.py repost --all-delivered
+```
+
 로컬 DB가 유실된 경우 ready marker에서 복구합니다.
 
 ```bash

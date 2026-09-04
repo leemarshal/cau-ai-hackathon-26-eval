@@ -15,6 +15,7 @@ import sys
 import time
 import uuid
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import ConfigError, Settings
@@ -385,6 +386,16 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="print the local queue and scores as JSON")
     retry = commands.add_parser("retry", help="requeue an errored submission")
     retry.add_argument("submission_id")
+    repost = commands.add_parser(
+        "repost", help="requeue previously delivered score POSTs"
+    )
+    repost_target = repost.add_mutually_exclusive_group(required=True)
+    repost_target.add_argument("submission_id", nargs="?")
+    repost_target.add_argument(
+        "--all-delivered",
+        action="store_true",
+        help="requeue every delivered score after a full leaderboard reset",
+    )
     commands.add_parser("reconcile", help="rebuild queue entries from ready markers")
     return root
 
@@ -414,6 +425,24 @@ def main(argv: list[str] | None = None) -> int:
             if not database.retry(args.submission_id):
                 raise RuntimeError("submission is not in error state or does not exist")
             publish_state(settings, database)
+        elif args.command == "repost":
+            next_attempt_at = datetime.now(timezone.utc).isoformat()
+            if args.all_delivered:
+                requeued = database.requeue_all_delivered_score_posts(
+                    next_attempt_at
+                )
+                if requeued == 0:
+                    raise RuntimeError("there are no delivered score POSTs to requeue")
+            else:
+                if not database.requeue_delivered_score_post(
+                    args.submission_id, next_attempt_at
+                ):
+                    raise RuntimeError(
+                        "score POST is not delivered or submission does not exist"
+                    )
+                requeued = 1
+            publish_state(settings, database)
+            print(json.dumps({"requeued_score_posts": requeued}))
         elif args.command == "reconcile":
             with watcher_lock(settings):
                 watcher = SubmissionWatcher(settings, database)

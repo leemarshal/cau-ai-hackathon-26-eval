@@ -630,6 +630,34 @@ class Database:
             )
             return result.rowcount
 
+    def requeue_delivered_score_post(
+        self, submission_id: str, next_attempt_at: str
+    ) -> bool:
+        """Schedule one delivered score for an explicit, clean repost."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            result = connection.execute(
+                "UPDATE score_posts SET status = 'pending', worker_id = NULL, "
+                "claim_token = NULL, claimed_at = NULL, delivered_at = NULL, "
+                "last_failed_at = NULL, last_error = NULL, next_attempt_at = ? "
+                "WHERE submission_id = ? AND status = 'delivered'",
+                (next_attempt_at, submission_id),
+            )
+            return result.rowcount == 1
+
+    def requeue_all_delivered_score_posts(self, next_attempt_at: str) -> int:
+        """Atomically schedule every delivered score for a clean repost."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            result = connection.execute(
+                "UPDATE score_posts SET status = 'pending', worker_id = NULL, "
+                "claim_token = NULL, claimed_at = NULL, delivered_at = NULL, "
+                "last_failed_at = NULL, last_error = NULL, next_attempt_at = ? "
+                "WHERE status = 'delivered'",
+                (next_attempt_at,),
+            )
+            return result.rowcount
+
     def score_post_rows(self) -> list[dict]:
         with self.connect() as connection:
             return [

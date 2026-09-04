@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -104,6 +107,51 @@ class SupervisorTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "runtime changed"):
                 cli._pin_grader_runtime(self.settings)
+
+    def test_repost_parser_requires_one_explicit_target(self) -> None:
+        submission_id = "625702e6-828c-49d1-93fc-f4597d873abf"
+        single = cli.parser().parse_args(["repost", submission_id])
+        self.assertEqual(single.submission_id, submission_id)
+        self.assertFalse(single.all_delivered)
+
+        all_delivered = cli.parser().parse_args(
+            ["repost", "--all-delivered"]
+        )
+        self.assertIsNone(all_delivered.submission_id)
+        self.assertTrue(all_delivered.all_delivered)
+
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli.parser().parse_args(["repost"])
+            with self.assertRaises(SystemExit):
+                cli.parser().parse_args(
+                    ["repost", submission_id, "--all-delivered"]
+                )
+
+    def test_repost_commands_requeue_without_touching_grading_result(self) -> None:
+        submission_id = "625702e6-828c-49d1-93fc-f4597d873abf"
+        database = mock.Mock()
+        database.requeue_delivered_score_post.return_value = True
+        database.requeue_all_delivered_score_posts.return_value = 3
+
+        with mock.patch.object(
+            cli.Settings, "from_env", return_value=self.settings
+        ), mock.patch.object(
+            cli, "Database", return_value=database
+        ), mock.patch.object(
+            cli, "publish_state"
+        ) as publish, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cli.main(["repost", submission_id]), 0)
+            self.assertEqual(cli.main(["repost", "--all-delivered"]), 0)
+
+        single_args = database.requeue_delivered_score_post.call_args.args
+        self.assertEqual(single_args[0], submission_id)
+        datetime.fromisoformat(single_args[1])
+        all_args = database.requeue_all_delivered_score_posts.call_args.args
+        datetime.fromisoformat(all_args[0])
+        self.assertEqual(publish.call_count, 2)
+        self.assertIn('"requeued_score_posts": 1', output.getvalue())
+        self.assertIn('"requeued_score_posts": 3', output.getvalue())
 
 
 if __name__ == "__main__":
