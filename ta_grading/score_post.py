@@ -10,6 +10,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 DEFAULT_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024
+USER_AGENT = "cau-ai-hackathon-26-eval/1.0"
 
 
 class ScorePostError(RuntimeError):
@@ -105,7 +106,11 @@ def post_score(
     request = Request(
         endpoint_url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
         method="POST",
     )
 

@@ -39,7 +39,7 @@ class FakeResponse:
 
 
 class ScorePostTests(unittest.TestCase):
-    def test_posts_exact_json_with_content_type_and_timeout(self) -> None:
+    def test_posts_exact_json_with_explicit_headers_and_timeout(self) -> None:
         response = FakeResponse(204, b"ok")
         with mock.patch.object(
             score_post._OPENER, "open", return_value=response
@@ -57,9 +57,27 @@ class ScorePostTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://api.minds.ai.kr/submit")
         self.assertEqual(request.data, b'{"team_id":8,"score":0.7321}')
         headers = {key.lower(): value for key, value in request.header_items()}
-        self.assertEqual(headers, {"content-type": "application/json"})
+        self.assertEqual(
+            headers,
+            {
+                "content-type": "application/json",
+                "accept": "application/json",
+                "user-agent": "cau-ai-hackathon-26-eval/1.0",
+            },
+        )
         self.assertEqual(response.read_sizes, [])
         self.assertTrue(response.closed)
+
+    def test_user_agent_does_not_regress_to_python_urllib_default(self) -> None:
+        response = FakeResponse(200)
+        with mock.patch.object(
+            score_post._OPENER, "open", return_value=response
+        ) as open_url:
+            score_post.post_score("https://example.test/submit", 1, 0.5)
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), score_post.USER_AGENT)
+        self.assertNotIn("Python-urllib", request.get_header("User-agent"))
 
     def test_integer_score_is_encoded_as_a_json_float(self) -> None:
         response = FakeResponse(200)
