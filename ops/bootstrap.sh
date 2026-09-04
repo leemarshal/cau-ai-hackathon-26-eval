@@ -18,11 +18,5 @@ python3 -m venv "${BOOTSTRAP_VENV}"
     -r "${SCRIPT_DIR}/bootstrap-requirements.txt"
 "${BOOTSTRAP_VENV}/bin/python" "${SCRIPT_DIR}/download-private-grading.py"
 
-docker build \
-    -f "${PROJECT_ROOT}/grading_docker/Dockerfile" \
-    -t "${TA_GRADING_IMAGE:-hackathon/private-test-grader:2026.09}" \
-    "${PROJECT_ROOT}"
-
 "${SCRIPT_DIR}/check.sh"
 printf '[bootstrap] ready; run %s\n' "${SCRIPT_DIR}/run.sh"
-

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .config import ConfigError, Settings
 from .database import Database
+from .poster import poster_loop
 from .publish import publish_state
 from .storage import discover_teams
 from .storage import atomic_write_json_no_clobber, fsync_dir
@@ -27,7 +28,7 @@ from .worker import worker_loop
 
 
 LOGGER = logging.getLogger("ta-grader")
-LOWER_SHA256_IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+RUNTIME_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def _configure_logging() -> None:
@@ -46,49 +47,83 @@ def _real_directory(path: Path, description: str) -> None:
         raise RuntimeError(f"{description} must be a real directory: {path}")
 
 
-def _resolve_grading_image(image: str) -> str:
-    result = subprocess.run(
-        ["docker", "image", "inspect", "--format", "{{.Id}}", "--", image],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    image_id = result.stdout.strip()
+def _resolve_grader_runtime(settings: Settings) -> dict:
+    try:
+        result = subprocess.run(
+            [str(settings.grader_python), str(settings.grade_script), "--runtime-info"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("native grader runtime check timed out") from exc
     if result.returncode != 0:
         raise RuntimeError(
-            f"grader image is unavailable: {image}: {result.stderr.strip()}"
+            "native grader runtime check failed: "
+            f"{(result.stderr or result.stdout).strip()}"
         )
-    if not LOWER_SHA256_IMAGE.fullmatch(image_id):
-        raise RuntimeError(f"Docker returned an invalid grader image ID: {image_id!r}")
-    return image_id
+    try:
+        runtime = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("native grader returned invalid runtime JSON") from exc
+    required = {
+        "schema_version",
+        "runtime_id",
+        "python",
+        "torch",
+        "torchvision",
+        "torch_cuda",
+        "cuda_available",
+        "cuda_device_count",
+        "code_sha256",
+    }
+    if not isinstance(runtime, dict) or not required.issubset(runtime):
+        raise RuntimeError("native grader returned an unexpected runtime schema")
+    runtime_id = runtime.get("runtime_id")
+    if not isinstance(runtime_id, str) or not RUNTIME_ID.fullmatch(runtime_id):
+        raise RuntimeError("native grader returned an invalid runtime ID")
+    if str(runtime.get("torch", "")).split("+", 1)[0] != "2.8.0":
+        raise RuntimeError("native grader requires torch 2.8.0")
+    if str(runtime.get("torchvision", "")).split("+", 1)[0] != "0.23.0":
+        raise RuntimeError("native grader requires torchvision 0.23.0")
+    if runtime.get("torch_cuda") != "12.8":
+        raise RuntimeError("native grader requires the PyTorch CUDA 12.8 build")
+    if not isinstance(runtime.get("cuda_available"), bool):
+        raise RuntimeError("native grader returned invalid CUDA availability")
+    device_count = runtime.get("cuda_device_count")
+    if isinstance(device_count, bool) or not isinstance(device_count, int):
+        raise RuntimeError("native grader returned an invalid CUDA device count")
+    return runtime
 
 
-def _pin_grading_image(settings: Settings) -> Settings:
-    """Keep one immutable grader image ID for the lifetime of this state DB."""
+def _pin_grader_runtime(settings: Settings) -> Settings:
+    """Keep one scorer/dependency fingerprint for the lifetime of this state DB."""
 
-    image_id = _resolve_grading_image(settings.grading_image)
+    runtime = _resolve_grader_runtime(settings)
+    runtime_id = runtime["runtime_id"]
     settings.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if settings.state_root.is_symlink() or not settings.state_root.is_dir():
         raise RuntimeError("TA state root must be a real local directory")
     settings.state_root.chmod(0o700)
-    pin_path = settings.state_root / "grader-image.json"
-    expected = {"schema_version": 1, "grader_image_id": image_id}
+    pin_path = settings.state_root / "grader-runtime.json"
+    expected = {"schema_version": 1, "grader_runtime_id": runtime_id}
     try:
         atomic_write_json_no_clobber(pin_path, expected, mode=0o600)
     except FileExistsError:
         if pin_path.is_symlink() or not pin_path.is_file():
-            raise RuntimeError("grader image pin is not a regular file")
+            raise RuntimeError("grader runtime pin is not a regular file")
         try:
             pinned = json.loads(pin_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("grader image pin is unreadable") from exc
+            raise RuntimeError("grader runtime pin is unreadable") from exc
         if pinned != expected:
             raise RuntimeError(
-                "grader image ID changed for this grading database; "
-                "restore the pinned image or use a deliberate new TA_STATE_ROOT"
+                "grader runtime changed for this grading database; restore the "
+                "pinned Python/packages/code or use a deliberate new TA_STATE_ROOT"
             )
-    return replace(settings, grading_image=image_id)
+    return replace(settings, grader_runtime_id=runtime_id)
 
 
 def check_environment(settings: Settings) -> dict:
@@ -106,7 +141,11 @@ def check_environment(settings: Settings) -> dict:
         raise RuntimeError(
             "exactly one Admin-Storage_* directory must exist and match TA_ADMIN_ROOT"
         )
-    teams = discover_teams(settings.mnt_root, settings.expected_team_count)
+    teams = discover_teams(
+        settings.mnt_root,
+        settings.expected_team_count,
+        settings.max_team_number,
+    )
 
     SubmissionWatcher(settings, Database(settings.database_path)).ensure_layout()
     probe_id = str(uuid.uuid4())
@@ -135,8 +174,12 @@ def check_environment(settings: Settings) -> dict:
 
     if not settings.grade_script.is_file() or settings.grade_script.is_symlink():
         raise RuntimeError(f"grade script is missing or unsafe: {settings.grade_script}")
-    if not os.access(settings.grade_script, os.X_OK):
-        raise RuntimeError(f"grade script is not executable: {settings.grade_script}")
+    if not settings.grader_python.is_file() or not os.access(
+        settings.grader_python, os.X_OK
+    ):
+        raise RuntimeError(
+            f"grader Python is missing or not executable: {settings.grader_python}"
+        )
     _real_directory(settings.grading_root, "private grading root")
     for relative in (
         "splits/test_split.pt",
@@ -147,7 +190,11 @@ def check_environment(settings: Settings) -> dict:
         if not (settings.grading_root / relative).exists():
             raise RuntimeError(f"private grading asset is missing: {relative}")
 
-    grading_image_id = _resolve_grading_image(settings.grading_image)
+    grader_runtime = _resolve_grader_runtime(settings)
+    if not grader_runtime["cuda_available"]:
+        raise RuntimeError("native PyTorch cannot access CUDA")
+    if grader_runtime["cuda_device_count"] < 4:
+        raise RuntimeError("native PyTorch must see all four GPUs")
     gpu_check = subprocess.run(
         ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
         text=True,
@@ -171,8 +218,9 @@ def check_environment(settings: Settings) -> dict:
         "backup_root": str(settings.backup_root),
         "database_path": str(settings.database_path),
         "grading_root": str(settings.grading_root),
-        "grading_image": settings.grading_image,
-        "grading_image_id": grading_image_id,
+        "grader_python": str(settings.grader_python),
+        "grader_runtime": grader_runtime,
+        "score_post_url": settings.score_post_url,
         "teams": list(teams),
         "automatic_gpus": list(settings.gpu_ids),
         "reserved_gpus": [0],
@@ -241,7 +289,7 @@ def supervise(settings: Settings, *, skip_check: bool = False) -> int:
         lock.close()
         raise RuntimeError("another TA grading supervisor is already running") from exc
 
-    settings = _pin_grading_image(settings)
+    settings = _pin_grader_runtime(settings)
     database = Database(settings.database_path)
     database.initialize()
     if not skip_check:
@@ -251,11 +299,13 @@ def supervise(settings: Settings, *, skip_check: bool = False) -> int:
         LOGGER.warning("requeued %d interrupted grading jobs", recovered)
     publish_state(settings, database)
 
-    commands = [[sys.executable, "-m", "ta_grading.cli", "watch"]]
+    launcher = settings.project_root / "ops/ta-grader.py"
+    commands = [[sys.executable, str(launcher), "watch"]]
     commands.extend(
-        [sys.executable, "-m", "ta_grading.cli", "worker", "--gpu", str(gpu)]
+        [sys.executable, str(launcher), "worker", "--gpu", str(gpu)]
         for gpu in settings.gpu_ids
     )
+    commands.append([sys.executable, str(launcher), "poster"])
     children: list[subprocess.Popen] = []
     stopping = False
     child_failure = 0
@@ -268,7 +318,8 @@ def supervise(settings: Settings, *, skip_check: bool = False) -> int:
     previous_int = signal.signal(signal.SIGINT, request_stop)
     try:
         child_environment = os.environ.copy()
-        child_environment["TA_GRADING_IMAGE"] = settings.grading_image
+        child_environment["TA_GRADER_PYTHON"] = str(settings.grader_python)
+        child_environment["TA_GRADER_RUNTIME_ID"] = settings.grader_runtime_id
         child_environment["TA_SUPERVISED_CHILD"] = "1"
         supervisor_pid = os.getpid()
         for command in commands:
@@ -282,7 +333,8 @@ def supervise(settings: Settings, *, skip_check: bool = False) -> int:
                 )
             )
         LOGGER.info(
-            "started watcher and CUDA workers %s; GPU 0 remains reserved",
+            "started watcher, score poster, and CUDA workers %s; "
+            "GPU 0 remains reserved",
             settings.gpu_ids,
         )
         while not stopping:
@@ -316,13 +368,19 @@ def _status(settings: Settings) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
-    commands.add_parser("check", help="validate mounts, private data, image, and GPUs")
+    commands.add_parser(
+        "check", help="validate mounts, private data, Python runtime, and GPUs"
+    )
     watch = commands.add_parser("watch", help="watch Team directories and enqueue backups")
     watch.add_argument("--once", action="store_true")
     worker = commands.add_parser("worker", help="run one automatic GPU worker")
     worker.add_argument("--gpu", type=int, required=True)
     worker.add_argument("--once", action="store_true")
-    run = commands.add_parser("run", help="run watcher plus GPU 1/2/3 workers")
+    poster = commands.add_parser("poster", help="deliver queued score API POSTs")
+    poster.add_argument("--once", action="store_true")
+    run = commands.add_parser(
+        "run", help="run watcher, score poster, and GPU 1/2/3 workers"
+    )
     run.add_argument("--skip-check", action="store_true")
     commands.add_parser("status", help="print the local queue and scores as JSON")
     retry = commands.add_parser("retry", help="requeue an errored submission")
@@ -344,8 +402,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "watch":
             watcher_loop(settings, once=args.once)
         elif args.command == "worker":
-            settings = _pin_grading_image(settings)
+            settings = _pin_grader_runtime(settings)
             worker_loop(settings, args.gpu, once=args.once)
+        elif args.command == "poster":
+            poster_loop(settings, once=args.once)
         elif args.command == "run":
             return supervise(settings, skip_check=args.skip_check)
         elif args.command == "status":

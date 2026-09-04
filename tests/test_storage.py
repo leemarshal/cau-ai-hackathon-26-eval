@@ -60,6 +60,40 @@ class TeamDiscoveryTests(TemporaryDirectoryTestCase):
                 with self.assertRaises(storage.StorageError):
                     storage.discover_teams(mnt, 3)
 
+    def test_allows_any_optional_subset_through_max_team_number(self) -> None:
+        mnt = self.root / "optional"
+        mnt.mkdir()
+        for name in (
+            "Team25_yyyyy",
+            "Team2_bbbbb",
+            "Team1_aaaaa",
+            "Team23_wwwww",
+            "Team3_ccccc",
+        ):
+            (mnt / name).mkdir()
+
+        teams = storage.discover_teams(mnt, 3, max_team_number=26)
+
+        self.assertEqual(
+            list(teams),
+            [
+                "Team1_aaaaa",
+                "Team2_bbbbb",
+                "Team3_ccccc",
+                "Team23_wwwww",
+                "Team25_yyyyy",
+            ],
+        )
+
+    def test_rejects_team_number_above_optional_maximum(self) -> None:
+        mnt = self.root / "above-maximum"
+        mnt.mkdir()
+        for name in ("Team1_a", "Team2_b", "Team3_c", "Team27_z"):
+            (mnt / name).mkdir()
+
+        with self.assertRaisesRegex(storage.StorageError, r"unexpected=\[27\]"):
+            storage.discover_teams(mnt, 3, max_team_number=26)
+
     def test_rejects_malformed_or_symlink_team_entries(self) -> None:
         malformed = self.root / "malformed"
         malformed.mkdir()
@@ -88,6 +122,13 @@ class TeamDiscoveryTests(TemporaryDirectoryTestCase):
             with self.subTest(expected_count=invalid):
                 with self.assertRaises(ValueError):
                     storage.discover_teams(real, invalid)
+
+        for invalid_maximum in (0, 1, True, 3.0):
+            with self.subTest(max_team_number=invalid_maximum):
+                with self.assertRaises(ValueError):
+                    storage.discover_teams(
+                        real, 2, max_team_number=invalid_maximum
+                    )
 
 
 class CheckpointEnumerationTests(TemporaryDirectoryTestCase):

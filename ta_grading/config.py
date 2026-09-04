@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import math
 import os
+import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
     pass
+
+
+RUNTIME_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def _path(name: str, default: str) -> Path:
@@ -33,7 +40,7 @@ def _float(name: str, default: float, *, minimum: float = 0.0) -> float:
         value = float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be numeric") from exc
-    if value < minimum:
+    if not math.isfinite(value) or value < minimum:
         raise ConfigError(f"{name} must be at least {minimum}")
     return value
 
@@ -45,6 +52,26 @@ def _boolean(name: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     raise ConfigError(f"{name} must be 0/1, true/false, yes/no, or on/off")
+
+
+def _https_url(name: str, default: str) -> str:
+    value = os.environ.get(name, default).strip()
+    if not value or any(character.isspace() for character in value):
+        raise ConfigError(f"{name} must be a valid HTTPS URL")
+    try:
+        parsed = urlsplit(value)
+        parsed.port
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a valid HTTPS URL") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ConfigError(f"{name} must be an HTTPS URL without credentials or fragment")
+    return value
 
 
 def _gpus() -> tuple[int, ...]:
@@ -72,8 +99,10 @@ class Settings:
     database_path: Path
     grading_root: Path
     grade_script: Path
-    grading_image: str
+    grader_python: Path
+    grader_runtime_id: str
     expected_team_count: int
+    max_team_number: int
     poll_seconds: float
     stable_confirmations: int
     post_copy_seconds: float
@@ -84,6 +113,9 @@ class Settings:
     gpu_ids: tuple[int, ...]
     max_submissions_per_team: int = 10
     max_pending_captures: int = 6
+    score_post_url: str = "https://api.minds.ai.kr/submit"
+    score_post_timeout_seconds: float = 10.0
+    score_post_retry_seconds: float = 60.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -103,8 +135,9 @@ class Settings:
             "TA_GRADING_ROOT", str(Path.home() / "private-grading/assets")
         )
         grade_script = _path(
-            "TA_GRADE_SCRIPT", str(project_root / "ops/grade-finalist.sh")
+            "TA_GRADE_SCRIPT", str(project_root / "ops/grade-finalist.py")
         )
+        grader_python = _path("TA_GRADER_PYTHON", sys.executable)
         min_bytes = _integer("TA_MIN_CHECKPOINT_BYTES", 300_000_000, minimum=1)
         max_bytes = _integer(
             "TA_MAX_CHECKPOINT_BYTES", 512 * 1024 * 1024, minimum=1
@@ -141,11 +174,17 @@ class Settings:
             admin_root.relative_to(mnt_root)
         except ValueError as exc:
             raise ConfigError("TA_ADMIN_ROOT must be inside TA_MNT_ROOT") from exc
-        grading_image = os.environ.get(
-            "TA_GRADING_IMAGE", "hackathon/private-test-grader:2026.09"
-        ).strip()
-        if not grading_image:
-            raise ConfigError("TA_GRADING_IMAGE must not be empty")
+        grader_runtime_id = os.environ.get("TA_GRADER_RUNTIME_ID", "").strip()
+        if grader_runtime_id and not RUNTIME_ID.fullmatch(grader_runtime_id):
+            raise ConfigError("TA_GRADER_RUNTIME_ID must be sha256:<64 lowercase hex>")
+        expected_team_count = _integer(
+            "TA_EXPECTED_TEAM_COUNT", 22, minimum=1
+        )
+        max_team_number = _integer("TA_MAX_TEAM_NUMBER", 26, minimum=1)
+        if max_team_number < expected_team_count:
+            raise ConfigError(
+                "TA_MAX_TEAM_NUMBER must be at least TA_EXPECTED_TEAM_COUNT"
+            )
         return cls(
             project_root=project_root,
             mnt_root=mnt_root,
@@ -155,8 +194,10 @@ class Settings:
             database_path=database_path,
             grading_root=grading_root,
             grade_script=grade_script,
-            grading_image=grading_image,
-            expected_team_count=_integer("TA_EXPECTED_TEAM_COUNT", 22, minimum=1),
+            grader_python=grader_python,
+            grader_runtime_id=grader_runtime_id,
+            expected_team_count=expected_team_count,
+            max_team_number=max_team_number,
             poll_seconds=_float("TA_POLL_SECONDS", 20.0, minimum=1.0),
             stable_confirmations=_integer(
                 "TA_STABLE_CONFIRMATIONS", 3, minimum=1
@@ -174,5 +215,14 @@ class Settings:
             ),
             max_pending_captures=_integer(
                 "TA_MAX_PENDING_CAPTURES", 6, minimum=1
+            ),
+            score_post_url=_https_url(
+                "TA_SCORE_POST_URL", "https://api.minds.ai.kr/submit"
+            ),
+            score_post_timeout_seconds=_float(
+                "TA_SCORE_POST_TIMEOUT_SECONDS", 10.0, minimum=0.1
+            ),
+            score_post_retry_seconds=_float(
+                "TA_SCORE_POST_RETRY_SECONDS", 60.0, minimum=1.0
             ),
         )

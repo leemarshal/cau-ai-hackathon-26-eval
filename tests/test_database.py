@@ -87,8 +87,10 @@ class DatabaseTests(unittest.TestCase):
 
     def test_initialize_migrates_legacy_claims_and_source_dispositions(self) -> None:
         legacy_path = Path(self.temporary.name) / "legacy.sqlite3"
-        legacy_schema = SCHEMA.replace("    claim_token TEXT,\n", "").replace(
-            ", 'limit_exceeded'", ""
+        legacy_schema = (
+            SCHEMA.split("CREATE TABLE IF NOT EXISTS score_posts", 1)[0]
+            .replace("    claim_token TEXT,\n", "")
+            .replace(", 'limit_exceeded'", "")
         )
         with sqlite3.connect(legacy_path) as connection:
             connection.executescript(legacy_schema)
@@ -127,7 +129,11 @@ class DatabaseTests(unittest.TestCase):
         )
         with legacy_database.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
+            score_posts = connection.execute(
+                "SELECT * FROM score_posts"
+            ).fetchall()
         self.assertEqual(version, DATABASE_SCHEMA_VERSION)
+        self.assertEqual(score_posts, [])
 
     def test_submission_numbers_increase_independently_per_team(self) -> None:
         self.assertEqual(self.database.allocate_submission_number("Team1_a"), 1)
@@ -350,6 +356,219 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(public["f1"], public["final_score"])
         self.assertEqual(public["cka_f_o"], normalized["cka_f_o"])
         self.assertEqual(public["cka_r_o"], normalized["cka_r_o"])
+
+        posts = self.database.score_post_rows()
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["submission_id"], value["submission_id"])
+        self.assertEqual(
+            {"team_id": posts[0]["team_id"], "score": posts[0]["score"]},
+            {"team_id": value["team_number"], "score": normalized["final_score"]},
+        )
+        self.assertEqual(posts[0]["status"], "pending")
+        self.assertEqual(posts[0]["attempt_count"], 0)
+        self.assertEqual(
+            posts[0]["next_attempt_at"], "2026-09-04T02:30:00+00:00"
+        )
+        self.assertEqual(self.database.summary()["score_post_counts"], {"pending": 1})
+
+    def test_mark_done_and_score_post_are_one_transaction(self) -> None:
+        value = marker("atomic-score-post")
+        self.assertTrue(self.database.ingest_marker(value))
+        claimed = self.database.claim_next(
+            2, "worker-cuda-2", "2026-09-04T02:40:00+00:00"
+        )
+        self.assertIsNotNone(claimed)
+        with self.database.connect() as connection:
+            connection.execute(
+                "CREATE TRIGGER reject_score_post BEFORE INSERT ON score_posts "
+                "BEGIN SELECT RAISE(ABORT, 'blocked score post'); END"
+            )
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "blocked score post"):
+            self.database.mark_done(
+                value["submission_id"],
+                claimed["claim_token"],
+                "2026-09-04T02:45:00+00:00",
+                metrics(),
+                "results/report.json",
+                "results/report.audit.json",
+            )
+
+        rolled_back = self.database.rows()[0]
+        self.assertEqual(rolled_back["status"], "running")
+        self.assertIsNone(rolled_back["finished_at"])
+        self.assertEqual(self.database.score_post_rows(), [])
+
+        with self.database.connect() as connection:
+            connection.execute("DROP TRIGGER reject_score_post")
+        self.database.mark_done(
+            value["submission_id"],
+            claimed["claim_token"],
+            "2026-09-04T02:45:00+00:00",
+            metrics(),
+            "results/report.json",
+            "results/report.audit.json",
+        )
+        self.assertEqual(self.database.rows()[0]["status"], "done")
+        self.assertEqual(len(self.database.score_post_rows()), 1)
+
+    def test_score_post_retry_schedule_and_stale_claim_guards(self) -> None:
+        value = marker("score-post-retry", team_number=8)
+        self.assertTrue(self.database.ingest_marker(value))
+        grading_claim = self.database.claim_next(
+            1, "grader", "2026-09-04T05:00:00+00:00"
+        )
+        self.assertIsNotNone(grading_claim)
+        self.database.mark_done(
+            value["submission_id"],
+            grading_claim["claim_token"],
+            "2026-09-04T05:10:00+00:00",
+            metrics(),
+            "results/report.json",
+            "results/report.audit.json",
+        )
+
+        self.assertIsNone(
+            self.database.claim_next_score_post(
+                "poster-1", "2026-09-04T05:09:59+00:00"
+            )
+        )
+        first = self.database.claim_next_score_post(
+            "poster-1", "2026-09-04T05:10:00+00:00"
+        )
+        self.assertIsNotNone(first)
+        self.assertEqual(first["team_id"], 8)
+        self.assertEqual(first["score"], metrics()["final_score"])
+        self.assertEqual(first["status"], "posting")
+        self.assertEqual(first["attempt_count"], 1)
+        self.assertRegex(first["claim_token"], r"\A[0-9a-f]{64}\Z")
+        observable = self.database.summary()["score_posts"][0]
+        self.assertEqual(observable["status"], "posting")
+        self.assertNotIn("claim_token", observable)
+        self.assertNotIn("worker_id", observable)
+        self.assertFalse(
+            self.database.mark_score_post_failed(
+                value["submission_id"],
+                "0" * 64,
+                "2026-09-04T05:10:01+00:00",
+                "stale failure",
+                "2026-09-04T05:20:00+00:00",
+            )
+        )
+        long_error = "discard-this-prefix:" + "x" * 4100
+        self.assertTrue(
+            self.database.mark_score_post_failed(
+                value["submission_id"],
+                first["claim_token"],
+                "2026-09-04T05:10:02+00:00",
+                long_error,
+                "2026-09-04T05:20:00+00:00",
+            )
+        )
+        failed = self.database.score_post_rows()[0]
+        self.assertEqual(failed["status"], "pending")
+        self.assertEqual(failed["attempt_count"], 1)
+        self.assertIsNone(failed["claim_token"])
+        self.assertEqual(len(failed["last_error"]), 4000)
+        self.assertEqual(failed["last_failed_at"], "2026-09-04T05:10:02+00:00")
+        self.assertIsNone(
+            self.database.claim_next_score_post(
+                "poster-2", "2026-09-04T05:19:59+00:00"
+            )
+        )
+
+        second = self.database.claim_next_score_post(
+            "poster-2", "2026-09-04T05:20:00+00:00"
+        )
+        self.assertIsNotNone(second)
+        self.assertEqual(second["attempt_count"], 2)
+        self.assertNotEqual(second["claim_token"], first["claim_token"])
+        self.assertFalse(
+            self.database.mark_score_post_delivered(
+                value["submission_id"],
+                first["claim_token"],
+                "2026-09-04T05:20:01+00:00",
+            )
+        )
+        self.assertTrue(
+            self.database.mark_score_post_delivered(
+                value["submission_id"],
+                second["claim_token"],
+                "2026-09-04T05:20:02+00:00",
+            )
+        )
+        delivered = self.database.score_post_rows()[0]
+        self.assertEqual(delivered["status"], "delivered")
+        self.assertEqual(delivered["attempt_count"], 2)
+        self.assertEqual(delivered["delivered_at"], "2026-09-04T05:20:02+00:00")
+        self.assertIsNone(delivered["last_error"])
+        self.assertIsNone(
+            self.database.claim_next_score_post(
+                "poster-3", "2026-09-04T06:00:00+00:00"
+            )
+        )
+
+    def test_score_post_claims_are_atomic_and_restart_requeues_them(self) -> None:
+        expected_ids = set()
+        for number in range(1, 4):
+            value = marker(
+                f"score-post-{number}",
+                team_name=f"Team{number}_post",
+                team_number=number,
+            )
+            expected_ids.add(value["submission_id"])
+            self.assertTrue(self.database.ingest_marker(value))
+            grading_claim = self.database.claim_next(
+                number, f"grader-{number}", "2026-09-04T06:00:00+00:00"
+            )
+            self.assertIsNotNone(grading_claim)
+            self.database.mark_done(
+                value["submission_id"],
+                grading_claim["claim_token"],
+                f"2026-09-04T06:0{number}:00+00:00",
+                metrics(),
+                f"results/{number}/report.json",
+                f"results/{number}/report.audit.json",
+            )
+
+        barrier = threading.Barrier(3)
+
+        def claim(number: int) -> dict | None:
+            worker_database = Database(self.database_path)
+            barrier.wait(timeout=5)
+            return worker_database.claim_next_score_post(
+                f"poster-{number}", "2026-09-04T07:00:00+00:00"
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            claimed = list(pool.map(claim, (1, 2, 3)))
+
+        self.assertNotIn(None, claimed)
+        claimed_rows = [row for row in claimed if row is not None]
+        self.assertEqual(
+            {row["submission_id"] for row in claimed_rows}, expected_ids
+        )
+        self.assertEqual(len({row["claim_token"] for row in claimed_rows}), 3)
+        self.assertEqual(self.database.requeue_posting_score_posts(), 3)
+        self.assertEqual(self.database.requeue_posting_score_posts(), 0)
+        recovered = self.database.score_post_rows()
+        self.assertEqual({row["status"] for row in recovered}, {"pending"})
+        self.assertTrue(all(row["attempt_count"] == 1 for row in recovered))
+        self.assertTrue(all(row["claim_token"] is None for row in recovered))
+        self.assertTrue(
+            all(
+                row["last_error"] == "requeued after score poster restart"
+                for row in recovered
+            )
+        )
+        for stale in claimed_rows:
+            self.assertFalse(
+                self.database.mark_score_post_delivered(
+                    stale["submission_id"],
+                    stale["claim_token"],
+                    "2026-09-04T07:00:01+00:00",
+                )
+            )
 
     def test_error_can_be_retried_and_attempt_count_increments(self) -> None:
         value = marker("retry")

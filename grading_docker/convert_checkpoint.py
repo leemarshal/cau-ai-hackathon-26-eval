@@ -1,10 +1,8 @@
 """Convert an untrusted PyTorch checkpoint into a safetensors state dict.
 
-This program is the *untrusted* half of the checkpoint boundary.  Loading a
-participant supplied ``.pt`` file can execute memory-unsafe deserialization
-code in affected PyTorch releases, even with ``weights_only=True``.  Therefore
-this file must run as the participant UID (or in a disposable, networkless
-container) and must never be given leaderboard secrets or private test data.
+This program is the checkpoint-conversion half of the native grading pipeline.
+It accepts only ``weights_only=True`` state dictionaries and runs in a separate
+CPU subprocess. The native pipeline does not add a filesystem sandbox.
 
 The trusted scorer consumes only the resulting ``.safetensors`` file.  It
 never calls ``torch.load`` on a participant artifact.
@@ -36,8 +34,7 @@ def _lock_process_limits(max_bytes: int, cpu_seconds: int) -> None:
     if cpu_seconds > 0:
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
 
-    # A failure here is non-fatal on non-Linux development hosts. Production
-    # additionally uses Docker's no-new-privileges and capability drop.
+    # A failure here is non-fatal on non-Linux development hosts.
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)

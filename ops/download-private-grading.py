@@ -8,8 +8,9 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import TypedDict
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import get_token, hf_hub_download, login
 
 
 EXPECTED_BYTES = 1_075_558_400
@@ -19,8 +20,19 @@ DEFAULT_REVISION = "5d8f84f903f177ebab5b43188a792d2436d50230"
 DEFAULT_FILENAME = "grading_docker.tar"
 
 
+class DownloadConfig(TypedDict):
+    repo: str
+    revision: str
+    filename: str
+    bytes: int
+    sha256: str
+
+
 def required_token(path: Path) -> str:
-    metadata = path.lstat()
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"HF token file does not exist: {path}") from exc
     if not stat.S_ISREG(metadata.st_mode):
         raise RuntimeError("HF token must be a regular non-symlink file")
     if stat.S_IMODE(metadata.st_mode) & 0o077:
@@ -29,6 +41,45 @@ def required_token(path: Path) -> str:
     if not token:
         raise RuntimeError("HF token file is empty")
     return token
+
+
+def hf_token() -> str:
+    """Load an explicit legacy token file or use Hugging Face's standard login."""
+    configured_path = os.environ.get("TA_HF_TOKEN_FILE", "").strip()
+    if configured_path:
+        legacy_path = Path(configured_path).expanduser()
+        if legacy_path.exists() or legacy_path.is_symlink():
+            try:
+                return required_token(legacy_path)
+            except RuntimeError as exc:
+                if "is empty" not in str(exc):
+                    raise
+        print(
+            "[bootstrap] legacy HF token file is absent or empty; using the standard "
+            f"Hugging Face login store instead: {legacy_path}",
+            file=sys.stderr,
+        )
+
+    cached = get_token()
+    if cached:
+        return cached
+
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Hugging Face is not logged in; run ./ops/bootstrap.sh once in an "
+            "interactive terminal"
+        )
+
+    print(
+        "[bootstrap] Hugging Face private dataset access is required.\n"
+        "[bootstrap] Paste the fine-grained read-only token at the hidden prompt; "
+        "it will be saved in Hugging Face's standard local token store."
+    )
+    login(add_to_git_credential=False, skip_if_logged_in=False)
+    cached = get_token()
+    if not cached:
+        raise RuntimeError("Hugging Face login completed without a usable token")
+    return cached
 
 
 def sha256(path: Path) -> str:
@@ -49,10 +100,7 @@ def main() -> int:
     grading_root = Path(
         os.environ.get("TA_GRADING_ROOT", Path.home() / "private-grading/assets")
     ).expanduser().resolve(strict=False)
-    token_path = Path(
-        os.environ.get("TA_HF_TOKEN_FILE", Path.home() / ".config/huggingface/token")
-    ).expanduser()
-    config = {
+    config: DownloadConfig = {
         "repo": os.environ.get("TA_HF_REPO", DEFAULT_REPO),
         "revision": os.environ.get("TA_HF_REVISION", DEFAULT_REVISION),
         "filename": os.environ.get("TA_HF_FILENAME", DEFAULT_FILENAME),
@@ -102,7 +150,7 @@ def main() -> int:
             repo_type="dataset",
             revision=config["revision"],
             filename=config["filename"],
-            token=required_token(token_path),
+            token=hf_token(),
             local_dir=download_root,
             cache_dir=cache_root,
         )

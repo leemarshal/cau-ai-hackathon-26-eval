@@ -94,9 +94,11 @@ class WorkerTests(unittest.TestCase):
             state_root=root / "state",
             database_path=root / "state/grading.sqlite3",
             grading_root=root / "private/assets",
-            grade_script=ROOT / "ops/grade-finalist.sh",
-            grading_image="fixture/grader:test",
+            grade_script=ROOT / "ops/grade-finalist.py",
+            grader_python=Path(sys.executable),
+            grader_runtime_id="sha256:" + "c" * 64,
             expected_team_count=1,
+            max_team_number=1,
             poll_seconds=0,
             stable_confirmations=1,
             post_copy_seconds=0,
@@ -162,7 +164,7 @@ class WorkerTests(unittest.TestCase):
         audit_path.write_text(
             json.dumps(
                 {
-                    "schema_version": "finalist-grading-audit-v2",
+                    "schema_version": "finalist-grading-audit-v3",
                     "submission_id": submission_id,
                     "original_checkpoint_sha256": self.marker["sha256"],
                     "converted_safetensors_sha256": "b" * 64,
@@ -171,7 +173,7 @@ class WorkerTests(unittest.TestCase):
                     ).hexdigest(),
                     "score_version": "unlearning-v2",
                     "test_dataset_revision": TEST_DATASET_REVISION,
-                    "grader_image_id": "sha256:" + "c" * 64,
+                    "grader_runtime_id": "sha256:" + "c" * 64,
                 }
             ),
             encoding="utf-8",
@@ -361,9 +363,9 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(stored["status"], "error")
         self.assertIn("SHA-256", stored["error"])
 
-    def test_pinned_grader_image_must_match_audit(self) -> None:
+    def test_pinned_grader_runtime_must_match_audit(self) -> None:
         row = self._claimed(3)
-        pinned = replace(self.settings, grading_image="sha256:" + "d" * 64)
+        pinned = replace(self.settings, grader_runtime_id="sha256:" + "d" * 64)
 
         def fake_run(command, **_kwargs):
             self._write_outputs(command)
@@ -376,7 +378,7 @@ class WorkerTests(unittest.TestCase):
 
         stored = self.database.rows()[0]
         self.assertEqual(stored["status"], "error")
-        self.assertIn("pinned image", stored["error"])
+        self.assertIn("pinned runtime", stored["error"])
 
     def test_only_one_worker_can_hold_a_gpu_lifetime_lock(self) -> None:
         with worker._gpu_lifetime_lock(self.settings, 1):

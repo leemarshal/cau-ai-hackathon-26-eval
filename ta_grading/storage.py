@@ -115,13 +115,19 @@ def _validate_size(size: int, min_bytes: int, max_bytes: int) -> None:
         )
 
 
-def discover_teams(mnt_root: Path, expected_count: int) -> dict[str, Path]:
-    """Return exact direct ``Team<number>_<suffix>`` directories.
+def discover_teams(
+    mnt_root: Path,
+    expected_count: int,
+    max_team_number: int | None = None,
+) -> dict[str, Path]:
+    """Return allowed direct ``Team<number>_<suffix>`` directories.
 
-    Team numbers must form precisely ``1..expected_count``.  A matching name
-    that is a symlink or non-directory is rejected rather than silently
-    ignored, and duplicate numeric team IDs are rejected even when their
-    suffixes differ.
+    Team numbers ``1..expected_count`` are required.  Higher team numbers are
+    optional through ``max_team_number``; when no maximum is supplied, it
+    defaults to ``expected_count`` and preserves the original exact-set
+    behavior.  A matching name that is a symlink or non-directory is rejected
+    rather than silently ignored, and duplicate numeric team IDs are rejected
+    even when their suffixes differ.
     """
 
     if (
@@ -130,6 +136,16 @@ def discover_teams(mnt_root: Path, expected_count: int) -> dict[str, Path]:
         or expected_count <= 0
     ):
         raise ValueError("expected_count must be a positive integer")
+    if max_team_number is None:
+        max_team_number = expected_count
+    elif (
+        isinstance(max_team_number, bool)
+        or not isinstance(max_team_number, int)
+        or max_team_number < expected_count
+    ):
+        raise ValueError(
+            "max_team_number must be an integer at least expected_count"
+        )
 
     root = Path(mnt_root)
     _require_real_directory(root)
@@ -164,18 +180,19 @@ def discover_teams(mnt_root: Path, expected_count: int) -> dict[str, Path]:
         names = ", ".join(repr(name) for name in sorted(invalid_team_entries))
         raise StorageError(f"invalid or unsafe Team entries under {root}: {names}")
 
-    expected = set(range(1, expected_count + 1))
+    required = set(range(1, expected_count + 1))
     actual = set(by_number)
-    if actual != expected:
-        missing = sorted(expected - actual)
-        unexpected = sorted(actual - expected)
+    missing = sorted(required - actual)
+    unexpected = sorted(number for number in actual if number > max_team_number)
+    if missing or unexpected:
         details = []
         if missing:
             details.append(f"missing={missing}")
         if unexpected:
             details.append(f"unexpected={unexpected}")
         raise StorageError(
-            f"team directories must be exactly Team1..Team{expected_count}: "
+            f"team directories must include Team1..Team{expected_count} and "
+            f"not exceed Team{max_team_number}: "
             + ", ".join(details)
         )
 

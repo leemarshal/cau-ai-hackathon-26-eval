@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 3
 _UNSET = object()
 
 
@@ -97,6 +97,28 @@ CREATE TABLE IF NOT EXISTS source_versions (
         source_mtime_ns, source_ctime_ns
     )
 );
+
+CREATE TABLE IF NOT EXISTS score_posts (
+    submission_id TEXT PRIMARY KEY REFERENCES submissions(id) ON DELETE CASCADE,
+    team_id INTEGER NOT NULL CHECK (team_id >= 1),
+    score REAL NOT NULL CHECK (score >= 0.0 AND score <= 1.0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'posting', 'delivered')),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    worker_id TEXT,
+    claim_token TEXT,
+    created_at TEXT NOT NULL,
+    next_attempt_at TEXT NOT NULL,
+    claimed_at TEXT,
+    delivered_at TEXT,
+    last_failed_at TEXT,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS score_posts_status_due
+ON score_posts(status, next_attempt_at, created_at, submission_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS score_posts_claim_token
+ON score_posts(claim_token) WHERE claim_token IS NOT NULL;
 """
 
 
@@ -469,6 +491,7 @@ class Database:
         audit_relative_path: str,
     ) -> None:
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             result = connection.execute(
                 """
                 UPDATE submissions SET status = 'done', finished_at = ?, error = NULL,
@@ -501,6 +524,121 @@ class Database:
                 raise LostClaimError(
                     "submission claim was lost before publishing score"
                 )
+            submission = connection.execute(
+                "SELECT team_number FROM submissions WHERE id = ?",
+                (submission_id,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO score_posts(
+                    submission_id, team_id, score, status, created_at,
+                    next_attempt_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    submission_id,
+                    submission["team_number"],
+                    metrics["final_score"],
+                    finished_at,
+                    finished_at,
+                ),
+            )
+
+    def claim_next_score_post(
+        self, worker_id: str, now: str
+    ) -> dict | None:
+        """Atomically claim the oldest score POST whose retry time is due."""
+        claim_token = secrets.token_hex(32)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT submission_id FROM score_posts "
+                "WHERE status = 'pending' AND claim_token IS NULL "
+                "AND next_attempt_at <= ? "
+                "ORDER BY next_attempt_at, created_at, submission_id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if row is None:
+                return None
+            updated = connection.execute(
+                "UPDATE score_posts SET status = 'posting', worker_id = ?, "
+                "claim_token = ?, claimed_at = ?, "
+                "attempt_count = attempt_count + 1 "
+                "WHERE submission_id = ? AND status = 'pending' "
+                "AND claim_token IS NULL AND next_attempt_at <= ?",
+                (worker_id, claim_token, now, row["submission_id"], now),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                "SELECT * FROM score_posts WHERE submission_id = ?",
+                (row["submission_id"],),
+            ).fetchone()
+            return dict(claimed)
+
+    def mark_score_post_delivered(
+        self, submission_id: str, claim_token: str, delivered_at: str
+    ) -> bool:
+        """Complete an owned POST claim, rejecting stale worker results."""
+        with self.connect() as connection:
+            result = connection.execute(
+                "UPDATE score_posts SET status = 'delivered', worker_id = NULL, "
+                "claim_token = NULL, claimed_at = NULL, delivered_at = ?, "
+                "last_failed_at = NULL, last_error = NULL "
+                "WHERE submission_id = ? AND status = 'posting' "
+                "AND claim_token = ?",
+                (delivered_at, submission_id, claim_token),
+            )
+            return result.rowcount == 1
+
+    def mark_score_post_failed(
+        self,
+        submission_id: str,
+        claim_token: str,
+        failed_at: str,
+        error: str,
+        next_attempt_at: str,
+    ) -> bool:
+        """Release an owned POST claim for a caller-scheduled retry."""
+        with self.connect() as connection:
+            result = connection.execute(
+                "UPDATE score_posts SET status = 'pending', worker_id = NULL, "
+                "claim_token = NULL, claimed_at = NULL, delivered_at = NULL, "
+                "last_failed_at = ?, last_error = ?, next_attempt_at = ? "
+                "WHERE submission_id = ? AND status = 'posting' "
+                "AND claim_token = ?",
+                (
+                    failed_at,
+                    error[-4000:],
+                    next_attempt_at,
+                    submission_id,
+                    claim_token,
+                ),
+            )
+            return result.rowcount == 1
+
+    def requeue_posting_score_posts(self) -> int:
+        """Recover score POST claims interrupted by a poster restart."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            result = connection.execute(
+                "UPDATE score_posts SET status = 'pending', worker_id = NULL, "
+                "claim_token = NULL, last_failed_at = claimed_at, "
+                "claimed_at = NULL, delivered_at = NULL, "
+                "last_error = 'requeued after score poster restart' "
+                "WHERE status = 'posting'"
+            )
+            return result.rowcount
+
+    def score_post_rows(self) -> list[dict]:
+        with self.connect() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM score_posts "
+                    "ORDER BY created_at, submission_id"
+                )
+            ]
 
     def mark_error(
         self, submission_id: str, claim_token: str, finished_at: str, error: str
@@ -569,7 +707,44 @@ class Database:
                     "SELECT * FROM submissions ORDER BY team_number, submission_number"
                 )
             ]
-        return {"counts": counts, "submissions": rows}
+            score_post_counts = {
+                row["status"]: row["count"]
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM score_posts "
+                    "GROUP BY status"
+                )
+            }
+            score_posts = [
+                self.score_post_for_json(dict(row))
+                for row in connection.execute(
+                    "SELECT * FROM score_posts "
+                    "ORDER BY created_at, submission_id"
+                )
+            ]
+        return {
+            "counts": counts,
+            "submissions": rows,
+            "score_post_counts": score_post_counts,
+            "score_posts": score_posts,
+        }
+
+    @staticmethod
+    def score_post_for_json(row: dict) -> dict:
+        """Return observable POST state without exposing ownership credentials."""
+        fields = (
+            "submission_id",
+            "team_id",
+            "score",
+            "status",
+            "attempt_count",
+            "created_at",
+            "next_attempt_at",
+            "claimed_at",
+            "delivered_at",
+            "last_failed_at",
+            "last_error",
+        )
+        return {field: row.get(field) for field in fields}
 
     @staticmethod
     def row_for_json(row: dict) -> dict:

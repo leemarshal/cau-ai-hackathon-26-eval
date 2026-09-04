@@ -228,7 +228,7 @@ class SubmissionWatcher:
         match = TEAM_NUMBER.fullmatch(team_name)
         if match is None or int(match.group(1)) != marker.get("team_number"):
             raise RuntimeError(f"ready marker team identity mismatch: {marker_path}")
-        if not 1 <= marker["team_number"] <= self.settings.expected_team_count:
+        if not 1 <= marker["team_number"] <= self.settings.max_team_number:
             raise RuntimeError(f"ready marker team number is out of range: {marker_path}")
         submission_number = marker.get("submission_number")
         if (
@@ -615,7 +615,9 @@ class SubmissionWatcher:
         self.ensure_layout()
         self.reconcile()
         teams = discover_teams(
-            self.settings.mnt_root, self.settings.expected_team_count
+            self.settings.mnt_root,
+            self.settings.expected_team_count,
+            self.settings.max_team_number,
         )
         pending = self._verify_pending(teams)
         capture_budget = max(

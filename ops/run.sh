@@ -12,5 +12,4 @@ if [ -f "${PROJECT_ROOT}/.env" ]; then
 fi
 
 cd "${PROJECT_ROOT}"
-exec python3 -m ta_grading.cli run "$@"
-
+exec "${TA_GRADER_PYTHON:-python3}" "${SCRIPT_DIR}/ta-grader.py" run "$@"

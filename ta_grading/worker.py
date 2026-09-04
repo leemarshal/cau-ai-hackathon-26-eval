@@ -107,12 +107,12 @@ def _validate_audit(
         "final_report_sha256",
         "score_version",
         "test_dataset_revision",
-        "grader_image_id",
+        "grader_runtime_id",
     }
     if not isinstance(audit, dict) or set(audit) != expected_keys:
         raise RuntimeError("grading audit has an unexpected schema")
     expected = {
-        "schema_version": "finalist-grading-audit-v2",
+        "schema_version": "finalist-grading-audit-v3",
         "submission_id": row["id"],
         "original_checkpoint_sha256": row["source_sha256"],
         "final_report_sha256": _sha256(report_path),
@@ -126,19 +126,17 @@ def _validate_audit(
         audit["converted_safetensors_sha256"]
     ):
         raise RuntimeError("grading audit converted checkpoint SHA-256 is invalid")
-    image_id = audit["grader_image_id"]
+    runtime_id = audit["grader_runtime_id"]
     if (
-        not isinstance(image_id, str)
-        or not image_id.startswith("sha256:")
-        or not LOWER_SHA256.fullmatch(image_id.removeprefix("sha256:"))
+        not isinstance(runtime_id, str)
+        or not runtime_id.startswith("sha256:")
+        or not LOWER_SHA256.fullmatch(runtime_id.removeprefix("sha256:"))
     ):
-        raise RuntimeError("grading audit image ID is invalid")
-    if (
-        settings.grading_image.startswith("sha256:")
-        and LOWER_SHA256.fullmatch(settings.grading_image.removeprefix("sha256:"))
-        and image_id != settings.grading_image
-    ):
-        raise RuntimeError("grading audit image ID does not match the pinned image")
+        raise RuntimeError("grading audit runtime ID is invalid")
+    if not settings.grader_runtime_id:
+        raise RuntimeError("grader runtime is not pinned")
+    if runtime_id != settings.grader_runtime_id:
+        raise RuntimeError("grading audit runtime ID does not match the pinned runtime")
 
 
 def _write_attempt_log(settings: Settings, row: dict, gpu: int, content: str) -> Path:
@@ -237,9 +235,10 @@ def process_one(settings: Settings, database: Database, row: dict, gpu: int) -> 
             _validate_audit(settings, audit_path, report_path, row)
         else:
             command = [
+                str(settings.grader_python),
                 str(settings.grade_script),
-                "--image",
-                settings.grading_image,
+                "--expected-runtime-id",
+                settings.grader_runtime_id,
                 "--checkpoint",
                 str(checkpoint),
                 "--expected-sha256",

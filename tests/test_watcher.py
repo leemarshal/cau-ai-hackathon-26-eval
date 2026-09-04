@@ -41,9 +41,11 @@ class SubmissionWatcherIntegrationTests(unittest.TestCase):
             state_root=self.root / "state",
             database_path=self.root / "state/grading.sqlite3",
             grading_root=self.root / "private-grading/assets",
-            grade_script=ROOT / "ops/grade-finalist.sh",
-            grading_image="test/grader:local",
+            grade_script=ROOT / "ops/grade-finalist.py",
+            grader_python=Path(sys.executable),
+            grader_runtime_id="sha256:" + "a" * 64,
             expected_team_count=len(self.teams),
+            max_team_number=len(self.teams),
             poll_seconds=0.0,
             stable_confirmations=1,
             post_copy_seconds=0.0,
@@ -145,6 +147,29 @@ class SubmissionWatcherIntegrationTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), payload)
         self.assertEqual(small.read_bytes(), b"tiny")
         self.assertEqual([item for item in rows if item["team_name"] == "Team2_bbbbb"], [])
+
+    def test_optional_reserve_team_is_discovered_and_queued(self) -> None:
+        reserve_name = "Team3_ccccc"
+        reserve_root = self.mnt_root / reserve_name
+        reserve_root.mkdir()
+        self.teams[reserve_name] = reserve_root
+        reserve_settings = replace(self.settings, max_team_number=3)
+        reserve_watcher = SubmissionWatcher(reserve_settings, self.database)
+        payload = b"reserve-checkpoint" * 8
+        source = self._write_model(reserve_name, "reserve.pt", payload)
+
+        for _ in range(3):
+            reserve_watcher.run_once()
+
+        rows = self.database.rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["team_name"], reserve_name)
+        self.assertEqual(row["team_number"], 3)
+        self.assertEqual(row["model_name"], "reserve.pt")
+        self.assertEqual(row["source_size_bytes"], len(payload))
+        self.assertEqual(row["source_sha256"], hashlib.sha256(payload).hexdigest())
+        self.assertEqual(source.read_bytes(), payload)
 
     def test_changed_file_restarts_stability_observation(self) -> None:
         source = self._write_model("Team1_aaaaa", "changing.pt", b"a" * 64)

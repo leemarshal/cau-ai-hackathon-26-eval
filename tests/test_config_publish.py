@@ -27,6 +27,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.mnt_root, Path("/mnt"))
         self.assertEqual(settings.admin_root, Path("/mnt/Admin-Storage_7ed0d"))
         self.assertEqual(settings.expected_team_count, 22)
+        self.assertEqual(settings.max_team_number, 26)
         self.assertEqual(settings.poll_seconds, 20.0)
         self.assertEqual(settings.stable_confirmations, 3)
         self.assertEqual(settings.post_copy_seconds, 20.0)
@@ -34,6 +35,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.max_submissions_per_team, 10)
         self.assertEqual(settings.max_pending_captures, 6)
         self.assertEqual(settings.gpu_ids, (1, 2, 3))
+        self.assertEqual(
+            settings.score_post_url, "https://api.minds.ai.kr/submit"
+        )
 
     def test_rejects_gpu_zero_or_a_different_automatic_set(self) -> None:
         for value in ("0,1,2", "1,2", "2,3,4"):
@@ -57,6 +61,35 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "direct Team children"):
                 Settings.from_env()
 
+    def test_max_team_number_cannot_exclude_required_teams(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"TA_EXPECTED_TEAM_COUNT": "22", "TA_MAX_TEAM_NUMBER": "21"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ConfigError, "at least"):
+                Settings.from_env()
+
+    def test_rejects_non_https_score_endpoint(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"TA_SCORE_POST_URL": "http://api.minds.ai.kr/submit"}, clear=True
+        ):
+            with self.assertRaisesRegex(ConfigError, "HTTPS URL"):
+                Settings.from_env()
+
+    def test_rejects_invalid_post_limits_and_endpoint_port(self) -> None:
+        cases = (
+            {"TA_SCORE_POST_TIMEOUT_SECONDS": "nan"},
+            {"TA_SCORE_POST_RETRY_SECONDS": "inf"},
+            {"TA_SCORE_POST_URL": "https://api.minds.ai.kr:99999/submit"},
+        )
+        for environment in cases:
+            with self.subTest(environment=environment), mock.patch.dict(
+                os.environ, environment, clear=True
+            ):
+                with self.assertRaises(ConfigError):
+                    Settings.from_env()
+
 
 class PublishTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -70,9 +103,11 @@ class PublishTests(unittest.TestCase):
             state_root=root / "state",
             database_path=root / "state/grading.sqlite3",
             grading_root=root / "private/assets",
-            grade_script=ROOT / "ops/grade-finalist.sh",
-            grading_image="fixture/grader:test",
+            grade_script=ROOT / "ops/grade-finalist.py",
+            grader_python=Path(sys.executable),
+            grader_runtime_id="sha256:" + "a" * 64,
             expected_team_count=1,
+            max_team_number=1,
             poll_seconds=0,
             stable_confirmations=1,
             post_copy_seconds=0,

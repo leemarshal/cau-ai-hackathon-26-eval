@@ -35,9 +35,11 @@ class SupervisorTests(unittest.TestCase):
             state_root=root / "state",
             database_path=root / "state/grading.sqlite3",
             grading_root=root / "private/assets",
-            grade_script=ROOT / "ops/grade-finalist.sh",
-            grading_image="fixture/grader:test",
+            grade_script=ROOT / "ops/grade-finalist.py",
+            grader_python=Path(sys.executable),
+            grader_runtime_id="sha256:" + "a" * 64,
             expected_team_count=1,
+            max_team_number=1,
             poll_seconds=20,
             stable_confirmations=3,
             post_copy_seconds=20,
@@ -53,6 +55,7 @@ class SupervisorTests(unittest.TestCase):
 
     def test_any_unexpected_child_exit_makes_supervisor_fail(self) -> None:
         pinned = "sha256:" + "a" * 64
+        runtime = {"runtime_id": pinned}
         for first_return_code, expected in ((0, 1), (7, 7)):
             with self.subTest(return_code=first_return_code):
                 created: list[tuple[tuple, dict]] = []
@@ -63,7 +66,7 @@ class SupervisorTests(unittest.TestCase):
                     return _FakeChild(20_000 + len(created), code)
 
                 with mock.patch.object(
-                    cli, "_resolve_grading_image", return_value=pinned
+                    cli, "_resolve_grader_runtime", return_value=runtime
                 ), mock.patch.object(
                     cli, "publish_state"
                 ), mock.patch.object(
@@ -74,23 +77,33 @@ class SupervisorTests(unittest.TestCase):
                     result = cli.supervise(self.settings, skip_check=True)
 
                 self.assertEqual(result, expected)
-                self.assertEqual(len(created), 4)
+                self.assertEqual(len(created), 5)
+                commands = [list(args[0]) for args, _kwargs in created]
+                self.assertTrue(any(command[-1] == "poster" for command in commands))
                 for _args, kwargs in created:
-                    self.assertEqual(kwargs["env"]["TA_GRADING_IMAGE"], pinned)
+                    self.assertEqual(kwargs["env"]["TA_GRADER_RUNTIME_ID"], pinned)
+                    self.assertEqual(
+                        kwargs["env"]["TA_GRADER_PYTHON"],
+                        str(self.settings.grader_python),
+                    )
                     self.assertEqual(kwargs["env"]["TA_SUPERVISED_CHILD"], "1")
                     self.assertIn("preexec_fn", kwargs)
                     self.assertIn("pass_fds", kwargs)
 
-    def test_grader_image_cannot_drift_for_an_existing_state_database(self) -> None:
+    def test_grader_runtime_cannot_drift_for_an_existing_state_database(self) -> None:
         first = "sha256:" + "a" * 64
         second = "sha256:" + "b" * 64
-        with mock.patch.object(cli, "_resolve_grading_image", return_value=first):
-            pinned = cli._pin_grading_image(self.settings)
-        self.assertEqual(pinned.grading_image, first)
+        with mock.patch.object(
+            cli, "_resolve_grader_runtime", return_value={"runtime_id": first}
+        ):
+            pinned = cli._pin_grader_runtime(self.settings)
+        self.assertEqual(pinned.grader_runtime_id, first)
 
-        with mock.patch.object(cli, "_resolve_grading_image", return_value=second):
-            with self.assertRaisesRegex(RuntimeError, "image ID changed"):
-                cli._pin_grading_image(self.settings)
+        with mock.patch.object(
+            cli, "_resolve_grader_runtime", return_value={"runtime_id": second}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "runtime changed"):
+                cli._pin_grader_runtime(self.settings)
 
 
 if __name__ == "__main__":
