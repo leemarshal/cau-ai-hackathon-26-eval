@@ -1,0 +1,44 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key
+*token*
+secrets/
+
+# Hugging Face and Python caches
+.cache/
+.huggingface/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.bootstrap-venv/
+
+# Private datasets, archives, checkpoints, and generated reports
+*.tar
+*.tar.*
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+*.JPEG
+grading_docker/dataset_manifest.json
+grading_docker/imagenet_test/
+grading_docker/m_o/
+grading_docker/score_cache/
+grading_docker/splits/
+incoming/
+staging/
+reports/
+logs/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
