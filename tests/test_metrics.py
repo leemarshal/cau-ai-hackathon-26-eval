@@ -19,6 +19,18 @@ from ta_grading.metrics import (  # noqa: E402
 
 
 SUBMISSION_ID = "123e4567-e89b-42d3-a456-426614174000"
+PINNED_ARCHIVE_FORGET_WNIDS = (
+    "n04252225",
+    "n04162706",
+    "n01950731",
+    "n02256656",
+    "n01558993",
+    "n02129604",
+    "n02361337",
+    "n03649909",
+    "n04371430",
+    "n02799071",
+)
 
 
 def harmonic(left: float, right: float) -> float:
@@ -70,11 +82,16 @@ def valid_report(*, score_depth: str = "pre") -> dict:
         "AUS": aus,
         "RUS_o": rus_o,
         "final_score": final_score,
-        "forget_wnids": list(EXPECTED_FORGET_WNIDS),
+        # Keep this test fixture independent from the validator constant.  The
+        # order is the one stored in the pinned private archive's refs.pt.
+        "forget_wnids": list(PINNED_ARCHIVE_FORGET_WNIDS),
     }
 
 
 class ValidateReportTests(unittest.TestCase):
+    def test_forget_class_order_matches_the_pinned_private_archive(self):
+        self.assertEqual(EXPECTED_FORGET_WNIDS, PINNED_ARCHIVE_FORGET_WNIDS)
+
     def test_normalizes_dict_and_path_reports(self):
         report = valid_report()
         expected_rus = harmonic(0.75, 0.80)

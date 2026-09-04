@@ -18,17 +18,19 @@ DEPTHS = ("b4", "b8", "b12", "pre")
 SCORE_DEPTH = "pre"
 REFERENCE_ACC_F = 0.0
 REFERENCE_ACC_R = 95.02962962962964
+# This order follows forget_labels in the pinned private refs.pt; it is not
+# lexicographic.  The scorer preserves the same order in every report.
 EXPECTED_FORGET_WNIDS = (
-    "n01558993",
-    "n01950731",
-    "n02129604",
-    "n02256656",
-    "n02361337",
-    "n02799071",
-    "n03649909",
-    "n04162706",
     "n04252225",
+    "n04162706",
+    "n01950731",
+    "n02256656",
+    "n01558993",
+    "n02129604",
+    "n02361337",
+    "n03649909",
     "n04371430",
+    "n02799071",
 )
 ABSOLUTE_TOLERANCE = 1e-9
 
